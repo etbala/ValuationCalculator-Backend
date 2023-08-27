@@ -8,14 +8,12 @@ module.exports.hello = async function (event, context) {
     
     if(ticker_exists === false) {
         return { 
-            statusCode: 404,
-            body: { 'error_type': 'invalid_ticker'},
+            statusCode: 403,
         };
     }
     if(yahoo_works === false) {
         return { 
-            statusCode: 404,
-            body: { 'error_type': 'yahoo_down'},
+            statusCode: 503,
         };
     }
     
