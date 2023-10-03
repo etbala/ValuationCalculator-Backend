@@ -8,7 +8,7 @@ module.exports.hello = async function (event, context) {
     
     if(ticker_exists === false) {
         return { 
-            statusCode: 403,
+            statusCode: 400,
         };
     }
     if(yahoo_works === false) {
@@ -42,6 +42,7 @@ let fy1 = "";
 let fy2 = "";
 let risk_free_rate = "";
 let forward_dividend_rate = "";
+let trailing_dividend_rate = "";
 
 // Static (?) Values
 let eps_growth = new Decimal(0.05);
@@ -57,13 +58,15 @@ async function scrapeStatistics(ticker) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
     });
+
+    const $ = cheerio.load(response.data);
     
-    if(response.request._redirectable._redirectCount > 1) {
+    const invalid_ticker = $('*:contains("Symbols similar to")').length > 0;
+    if(invalid_ticker) {
         ticker_exists = false;
         return;
     }
-
-    const $ = cheerio.load(response.data);
+    
     stock_price = $('fin-streamer[data-symbol="' + ticker + '"][data-test="qsp-price"]').attr('value');
     beta = $('span:contains("Beta (5Y Monthly)")').parent().next().text();
     shares = $('span:contains("Shares Outstanding")').eq(0).parent().next().text();
@@ -73,6 +76,7 @@ async function scrapeStatistics(ticker) {
     debt = $('span:contains("Total Debt")').eq(0).parent().next().text();
     cash = $('span:contains("Total Cash")').eq(0).parent().next().text();
     forward_dividend_rate = $('span:contains("Forward Annual Dividend Rate")').parent().next().text();
+    trailing_dividend_rate = $('span:contains("Trailing Annual Dividend Rate")').parent().next().text();
 }
 
 async function scrapeAnalytics(ticker) {
@@ -81,11 +85,6 @@ async function scrapeAnalytics(ticker) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
     });
-
-    if(response.request._redirectable._redirectCount > 1) {
-        ticker_exists = false;
-        return;
-    }
 
     const $ = cheerio.load(response.data);
     const table = $('table[class="W(100%) M(0) BdB Bdc($seperatorColor) Mb(25px)"]').eq(0);
@@ -110,14 +109,23 @@ async function scrapeTreasuryYield() {
 
 // Converts scraped values to useable decimal/integer formats
 function translationLayer() {
-    // Payout Ratio
-    payout_ratio = payout_ratio.replace(/[^\d.-]/g, '');
-    payout_ratio = new Decimal(payout_ratio).div(100);
-
+    // N/A may be valid for payout ratio and forward dividend rate
+    if(payout_ratio !== "N/A") {
+        payout_ratio = payout_ratio.replace(/[^\d.-]/g, '');
+        let temp = new Decimal(payout_ratio).div(100);
+        payout_ratio = temp.toFixed(2);
+    }
+    
+    if(shares === "N/A" || debt === "N/A" || cash === "N/A" || fy0 === "N/A" || fy1 === "N/A" || fy2 === "N/A" || 
+       stock_price === "N/A" || beta === "N/A" || risk_free_rate === "N/A" || book_value === "N/A") {
+        yahoo_works = false;
+        return;
+    }
+    
     // Shares
     let unit = shares.slice(-1);
     shares = shares.replace(/[^\d.-]/g, '');
-    shares = new Decimal(parseInt(shares));
+    shares = new Decimal(parseFloat(shares));
     if(unit == 'B') {
         shares = shares.times(new Decimal(1000000000));
     } else if(unit == 'M') {
@@ -129,7 +137,7 @@ function translationLayer() {
     // Debt
     unit = debt.slice(-1);
     debt = debt.replace(/[^\d.-]/g, '');
-    debt = new Decimal(parseInt(debt));
+    debt = new Decimal(parseFloat(debt));
     if(unit == 'B') {
         debt = debt.times(new Decimal(1000000000));
     } else if(unit == 'M') {
@@ -141,7 +149,7 @@ function translationLayer() {
     // Cash
     unit = cash.slice(-1);
     cash = cash.replace(/[^\d.-]/g, '');
-    cash = new Decimal(parseInt(cash));
+    cash = new Decimal(parseFloat(cash));
     if(unit == 'B') {
         cash = cash.times(new Decimal(1000000000));
     } else if(unit == 'M') {
@@ -158,7 +166,6 @@ function translationLayer() {
     beta = beta.replace(/[^\d.-]/g, '');
     book_value = book_value.replace(/[^\d.-]/g, '');
     risk_free_rate = risk_free_rate.replace(/[^\d.-]/g, '');
-    forward_dividend_rate = forward_dividend_rate.replace(/[^\d.-]/g, '');
 
     // Make sure system knows decimal numbers with fixed length
     fy0                     = new Decimal(fy0);
@@ -167,8 +174,7 @@ function translationLayer() {
     stock_price             = new Decimal(stock_price);
     beta                    = new Decimal(beta);
     book_value              = new Decimal(book_value);
-    risk_free_rate          = new Decimal(risk_free_rate);
-    forward_dividend_rate   = new Decimal(forward_dividend_rate);
+    risk_free_rate          = new Decimal(risk_free_rate).div(100);
 }
 
 function calculateMonthsToFYE() {
@@ -199,7 +205,7 @@ function generateJSON() {
     dict["fy1"] = parseFloat(fy1);
     dict["fy2"] = parseFloat(fy2);
     dict["monthsToFYE"] = monthsToFYE;
-    dict["payout_ratio"] = parseFloat(payout_ratio);
+    dict["payout_ratio"] = payout_ratio;
     dict["eps_growth"] = parseFloat(eps_growth);
     dict["book_value"] = parseFloat(book_value);
     dict["stock_price"] = parseFloat(stock_price);
@@ -209,15 +215,24 @@ function generateJSON() {
     dict["risk_free_rate"] = parseFloat(risk_free_rate);
     dict["beta"] = parseFloat(beta);
     dict["risk_premium"] = parseFloat(risk_premium);
-    data["forward_dividend_rate"] = parseFloat(forward_dividend_rate);
+    dict["forward_dividend_rate"] = forward_dividend_rate;
+    dict["trailing_dividend_rate"] = trailing_dividend_rate;
 
     return JSON.stringify(dict);
 }
 
 async function main(ticker) {
+    ticker_exists = true;
+    yahoo_works = true;
+    
+    if(ticker.length > 4 || ticker === '') {
+        ticker_exists = false;
+        return;
+    }
+    
     await Promise.all([scrapeStatistics(ticker), scrapeAnalytics(ticker), scrapeTreasuryYield()]);
-    if(ticker_exists === false || yahoo_works === false) { return; }
+    if(ticker_exists === false) { return; }
     translationLayer();
+    if(yahoo_works === false) { return; }
     calculateMonthsToFYE();
-    console.log(generateJSON());
 }
