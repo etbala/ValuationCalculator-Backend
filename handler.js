@@ -2,6 +2,8 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const Decimal = require('decimal.js');
+const puppeteer = require("puppeteer-core");
+const chromium = require('chrome-aws-lambda');
 
 module.exports.hello = async function (event, context) {
     await main(event['queryStringParameters']['ticker']);
@@ -51,7 +53,6 @@ let risk_premium = new Decimal(0.05);
 // Calculated Values
 let monthsToFYE = -1;
 
-
 async function scrapeStatistics(ticker) {
     const response = await axios.get(`https://finance.yahoo.com/quote/${ticker}/key-statistics`, {
         headers: {
@@ -70,7 +71,7 @@ async function scrapeStatistics(ticker) {
     stock_price = $('fin-streamer[data-symbol="' + ticker + '"][data-test="qsp-price"]').attr('value');
     beta = $('span:contains("Beta (5Y Monthly)")').parent().next().text();
     shares = $('span:contains("Shares Outstanding")').eq(0).parent().next().text();
-    payout_ratio = $('span:contains("Payout Ratio")').parent().next().text();
+    //payout_ratio = $('span:contains("Payout Ratio")').parent().next().text();
     fiscal_year_end = $('span:contains("Fiscal Year Ends")').parent().next().text();
     book_value = $('span:contains("Book Value Per Share")').parent().next().text();
     debt = $('span:contains("Total Debt")').eq(0).parent().next().text();
@@ -96,6 +97,75 @@ async function scrapeAnalytics(ticker) {
     fy2 = avg_estimate_row.find('td').eq(4).text();
 }
 
+async function scrapeCashFlow(ticker) {
+    async function fetchPageHTML(ticker) {
+        const browser = await puppeteer.launch({
+            args: chromium.args,
+            executablePath: await chromium.executablePath,
+            headless: chromium.headless,
+        });
+        const page = await browser.newPage();
+    
+        await page.goto(`https://finance.yahoo.com/quote/${ticker}/cash-flow?p=${ticker}`);
+    
+        await Promise.all([
+            page.click('button[aria-label="Financing Cash Flow"]'),
+            page.waitForSelector('button[aria-label="Cash Flow from Continuing Financing Activities"]', { visible: true })
+        ]);
+        await Promise.all([
+            page.click('button[aria-label="Cash Flow from Continuing Financing Activities"]'),
+            page.waitForSelector('button[aria-label="Net Common Stock Issuance"]', { visible: true })
+        ]);
+        await Promise.all([
+            page.click('button[aria-label="Operating Cash Flow"]'),
+            page.waitForSelector('button[aria-label="Cash Flow from Continuing Operating Activities"]', { visible: true })
+        ]);
+        await Promise.all([
+            page.click('button[aria-label="Cash Flow from Continuing Operating Activities"]'),
+            page.waitForSelector('div[title="Net Income from Continuing Operations"]', { visible: true })
+        ]);
+    
+        const content = await page.content();
+        await browser.close();
+        return content;
+    }
+    
+    async function getData(html, label) {
+        const $ = cheerio.load(html);
+        const labelSpan = $(`span:contains(${label})`);
+        if (labelSpan.length === 0) return null;
+    
+        const rowDiv = labelSpan.parent().parent().parent();
+        const valueDiv = rowDiv.children().eq(1);
+        const value = valueDiv.find('span').text();
+        
+        return value;
+    }
+
+    const html = await fetchPageHTML(ticker);
+    
+    let stock_issuance = await getData(html, 'Net Common Stock Issuance');
+    let dividends_paid = await getData(html, 'Cash Dividends Paid');
+    let net_income = await getData(html, 'Net Income from Continuing Operations');
+
+    // Convert To Integers & Make swap sign of dividends
+    if(stock_issuance === '' || stock_issuance === null)    { stock_issuance = new Decimal(0); } 
+    else                                                    { stock_issuance = new Decimal(stock_issuance.replace(/,/g, '')); }
+    if(dividends_paid === '' || dividends_paid === null)    { dividends_paid = new Decimal(0); }
+    else                                                    { dividends_paid = new Decimal(0).minus(new Decimal(dividends_paid.replace(/,/g, ''))); }
+    net_income = new Decimal(net_income.replace(/,/g, ''));
+
+    payout_ratio = dividends_paid.minus(stock_issuance).div(net_income);
+    if(payout_ratio.greaterThan(new Decimal(1))) {
+        payout_ratio = new Decimal(1);
+    } else if(payout_ratio.lessThan(new Decimal(0))) {
+        payout_ratio = new Decimal(0);
+    }
+
+    console.log("Payout Ratio: " + parseFloat(payout_ratio).toFixed(2));
+    console.log("Plowback Rate: " + parseFloat(new Decimal(1).minus(payout_ratio)).toFixed(2));
+}
+
 async function scrapeTreasuryYield() {
     const response = await axios.get(`https://finance.yahoo.com/quote/%5ETYX`, {
         headers: {
@@ -109,12 +179,7 @@ async function scrapeTreasuryYield() {
 
 // Converts scraped values to useable decimal/integer formats
 function translationLayer() {
-    // N/A may be valid for payout ratio and forward dividend rate
-    if(payout_ratio !== "N/A") {
-        payout_ratio = payout_ratio.replace(/[^\d.-]/g, '');
-        let temp = new Decimal(payout_ratio).div(100);
-        payout_ratio = temp.toFixed(2);
-    }
+    if(payout_ratio.lessThan(0)) { payout_ratio = "N/A"; }
     
     if(shares === "N/A" || debt === "N/A" || cash === "N/A" || fy0 === "N/A" || fy1 === "N/A" || fy2 === "N/A" || 
        stock_price === "N/A" || beta === "N/A" || risk_free_rate === "N/A" || book_value === "N/A") {
@@ -205,7 +270,7 @@ function generateJSON() {
     dict["fy1"] = parseFloat(fy1);
     dict["fy2"] = parseFloat(fy2);
     dict["monthsToFYE"] = monthsToFYE;
-    dict["payout_ratio"] = payout_ratio;
+    dict["payout_ratio"] = parseFloat(payout_ratio).toFixed(2);
     dict["eps_growth"] = parseFloat(eps_growth);
     dict["book_value"] = parseFloat(book_value);
     dict["stock_price"] = parseFloat(stock_price);
@@ -230,9 +295,11 @@ async function main(ticker) {
         return;
     }
     
-    await Promise.all([scrapeStatistics(ticker), scrapeAnalytics(ticker), scrapeTreasuryYield()]);
+    await Promise.all([scrapeStatistics(ticker), scrapeAnalytics(ticker), scrapeCashFlow(ticker), scrapeTreasuryYield()]);
     if(ticker_exists === false) { return; }
     translationLayer();
     if(yahoo_works === false) { return; }
     calculateMonthsToFYE();
+
+    console.log(generateJSON());
 }

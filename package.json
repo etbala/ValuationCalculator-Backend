@@ -2,6 +2,8 @@
   "dependencies": {
     "axios": "^1.4.0",
     "cheerio": "^1.0.0-rc.12",
-    "decimal.js": "^10.4.3"
+    "chrome-aws-lambda": "^10.1.0",
+    "decimal.js": "^10.4.3",
+    "puppeteer-core": "^21.3.8"
   }
 }
